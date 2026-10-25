@@ -109,7 +109,7 @@ jobs:
           dhcp-script=ifup wan
           max-fail=3
           # GBK service name: wired 1x Internet; replace built-in property 0x39.
-          rj-option=39:d3d0cfdf3178c9cfcdf8:r
+          rj-option=39:d3d0cfdf3178c9cfcdf800000000000000000000000000000000000000000000:r
           EOF
       - name: Build matching IPK
         run: |
