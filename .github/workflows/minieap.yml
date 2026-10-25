@@ -1,0 +1,190 @@
+name: Build MiniEAP for CR6606
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/minieap.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      SDK_URL: https://downloads.immortalwrt.org/releases/24.10.4/targets/ramips/mt7621/immortalwrt-sdk-24.10.4-ramips-mt7621_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+      SDK_SHA256: 61eb9228d9649cf92f8301ad19d9043f8da44321d9bb3e1337e94a2c3376437d
+      SOURCE_COMMIT: 983fd4a5851d4a344fab92666c5cdb83f26b2294
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync unzip zlib1g-dev file wget curl zstd qemu-user
+      - name: Download verified SDK and pinned upstream
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 "$SDK_URL" -o sdk.tar.zst
+          printf '%s  sdk.tar.zst\n' "$SDK_SHA256" | sha256sum -c -
+          mkdir sdk
+          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+          mkdir -p sdk/package/minieap/src sdk/package/minieap/files artifacts
+          curl --fail --location --retry 3 "https://codeload.github.com/updateing/minieap/tar.gz/$SOURCE_COMMIT" -o source.tar.gz
+          tar -xf source.tar.gz -C sdk/package/minieap/src --strip-components=1
+      - name: Fix authentication scratch buffer bounds
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('sdk/package/minieap/src/packet_plugin/rjv3/rjv3_hashes/checkV4.c')
+          s = p.read_text()
+          for before, after in [('unsigned char wtmp[160];', 'unsigned char wtmp[256];'), ('unsigned char tmp[40];', 'unsigned char tmp[128];')]:
+              assert s.count(before) == 1, before
+              s = s.replace(before, after)
+          p.write_text(s)
+          PY
+      - name: Prepare OpenWrt package
+        run: |
+          cat > sdk/package/minieap/Makefile <<'EOF'
+          include $(TOPDIR)/rules.mk
+          PKG_NAME:=minieap
+          PKG_VERSION:=0.93.git983fd4a
+          PKG_RELEASE:=1
+          PKG_LICENSE:=GPL-3.0
+          PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+          include $(INCLUDE_DIR)/package.mk
+          define Package/minieap
+            SECTION:=net
+            CATEGORY:=Network
+            TITLE:=MiniEAP with Ruijie V3/V4 support
+            DEPENDS:=+libc
+            URL:=https://github.com/updateing/minieap
+          endef
+          define Package/minieap/conffiles
+          /etc/minieap.conf
+          endef
+          define Build/Prepare
+          	$(CP) ./src/. $(PKG_BUILD_DIR)/
+          endef
+          define Build/Configure
+          endef
+          define Build/Compile
+          	$(MAKE) -C $(PKG_BUILD_DIR) $(TARGET_CONFIGURE_OPTS) CFLAGS="$(TARGET_CFLAGS) -fcommon" LDFLAGS="$(TARGET_LDFLAGS)" STATIC_BUILD=true
+          endef
+          define Package/minieap/install
+          	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d
+          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/minieap $(1)/usr/sbin/minieap
+          	$(INSTALL_BIN) ./files/minieap.init $(1)/etc/init.d/minieap
+          	$(INSTALL_CONF) ./files/minieap.conf $(1)/etc/minieap.conf
+          	chmod 600 $(1)/etc/minieap.conf
+          endef
+          $(eval $(call BuildPackage,minieap))
+          EOF
+          # Restore literal make recipe tabs from the workflow's portable text.
+          sed -i 's/^\\t/\t/' sdk/package/minieap/Makefile
+          cat > sdk/package/minieap/files/minieap.init <<'EOF'
+          #!/bin/sh /etc/rc.common
+          START=95
+          STOP=10
+          USE_PROCD=1
+          start_service() {
+              grep -q '^username=CHANGE_ME$' /etc/minieap.conf && return 1
+              grep -q '^password=CHANGE_ME$' /etc/minieap.conf && return 1
+              procd_open_instance
+              procd_set_param command /usr/sbin/minieap --conf-file /etc/minieap.conf --daemonize 0
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+          EOF
+          cat > sdk/package/minieap/files/minieap.conf <<'EOF'
+          # Edit username and password locally before starting.
+          username=CHANGE_ME
+          password=CHANGE_ME
+          nic=wan
+          module=rjv3
+          daemonize=0
+          eap-bcast-addr=1
+          dhcp-type=2
+          dhcp-script=ifup wan
+          max-fail=3
+          # GBK service name: wired 1x Internet; replace built-in property 0x39.
+          rj-option=39:d3d0cfdf3178c9cfcdf8:r
+          EOF
+      - name: Build matching IPK
+        run: |
+          set -euo pipefail
+          cd sdk
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_minieap=m
+          # CONFIG_ALL is not set
+          # CONFIG_ALL_NONSHARED is not set
+          # CONFIG_ALL_KMODS is not set
+          # CONFIG_SIGNED_PACKAGES is not set
+          EOF
+          make defconfig
+          make package/minieap/compile -j2 V=s 2>&1 | tee ../build.log
+      - name: Test actual MIPS binary and authentication hashes
+        run: |
+          set -euo pipefail
+          src="$PWD/sdk/package/minieap/src"
+          binary=$(find sdk/build_dir -path '*/.pkgdir/minieap/usr/sbin/minieap' -print -quit)
+          test -n "$binary"
+          file "$binary" | tee artifacts/binary-info.txt
+          timeout 20 qemu-mipsel "$binary" --help > artifacts/minieap-help.txt 2>&1
+          grep -q -- '--rj-option' artifacts/minieap-help.txt
+          grep -q -- '--service' artifacts/minieap-help.txt
+          tc=$(find "$PWD/sdk/staging_dir" -maxdepth 1 -type d -name 'toolchain-mipsel*' -print -quit)
+          export STAGING_DIR="$PWD/sdk/staging_dir"
+          cc="$tc/bin/mipsel-openwrt-linux-musl-gcc"
+          cat > hash-test.c <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+          #include "checkV4.h"
+          int main(void) {
+              unsigned char seed[16];
+              for (int v = 0; v < 50; v++) {
+                  for (int i = 0; i < 16; i++) seed[i] = 128 + (v * 17 + i * 13) % 128;
+                  seed[0] = v;
+                  seed[3] = 0;
+                  const char *out = (const char *)computeV4(seed, 16);
+                  if (!out || strlen(out) != 128) return 2;
+                  puts(out);
+              }
+              char user[65], pass[65];
+              memset(user, 'u', 64); user[64] = 0;
+              memset(pass, 'p', 64); pass[64] = 0;
+              const unsigned char *pwd = (const unsigned char *)computePwd(seed, user, pass);
+              for (int i = 0; i < 16; i++) printf("%02x", pwd[i]);
+              puts("");
+              return 0;
+          }
+          EOF
+          hashes="$src/packet_plugin/rjv3/rjv3_hashes"
+          "$cc" -Os -static -fcommon -fstack-protector-all -D_FORTIFY_SOURCE=2 -mips32r2 -msoft-float -I"$tc/include/fortify" -I"$hashes" -I"$src/include" hash-test.c "$hashes"/*.c "$src/md5.c" -o hash-mips
+          timeout 30 qemu-mipsel ./hash-mips > artifacts/mips-vectors.txt
+          gcc -O1 -fcommon -fsanitize=address -I"$hashes" -I"$src/include" hash-test.c "$hashes"/*.c "$src/md5.c" -o hash-native
+          ./hash-native > artifacts/native-vectors.txt
+          diff -u artifacts/native-vectors.txt artifacts/mips-vectors.txt
+          echo 'PASS: MIPS program help; 50 V4 vectors covering five branches; 64-byte credentials; native ASan and MIPS outputs match. Campus authentication requires router testing.' > artifacts/test-results.txt
+      - name: Collect packages and provenance
+        run: |
+          set -euo pipefail
+          find sdk/bin/packages -name 'minieap_*.ipk' -exec cp {} artifacts/ \;
+          test -n "$(find artifacts -name '*.ipk' -print -quit)"
+          cp sdk/package/minieap/files/minieap.conf artifacts/minieap.conf.example
+          printf 'Upstream: https://github.com/updateing/minieap\nCommit: %s\nSDK: %s\nSDK SHA256: %s\nBuild: static musl, sockraw, printer, rjv3; bounded scratch buffers (256/128 bytes).\n' "$SOURCE_COMMIT" "$SDK_URL" "$SDK_SHA256" > artifacts/build-info.txt
+          cd artifacts
+          sha256sum *.ipk > SHA256SUMS.txt
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minieap-build-log
+          path: build.log
+      - name: Upload MiniEAP package and test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: minieap-immortalwrt-24.10.4-mipsel_24kc
+          path: artifacts/
+          if-no-files-found: error
