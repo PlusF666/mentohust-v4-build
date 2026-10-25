@@ -96,9 +96,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          find sdk/bin/packages -name 'mentohust_4.0.alpha2-1_mipsel_24kc.ipk' -exec cp {} artifacts/ ';'
-          test -s artifacts/mentohust_4.0.alpha2-1_mipsel_24kc.ipk
-          binary=$(find sdk/build_dir -path '*/src/mentohust' -type f | head -n 1)
+          find sdk/bin/packages -name 'mentohust_4.0.alpha2-r1_mipsel_24kc.ipk' -exec cp {} artifacts/ ';'
+          test -s artifacts/mentohust_4.0.alpha2-r1_mipsel_24kc.ipk
+          binary=$(find sdk/build_dir -path '*/.pkgdir/mentohust/usr/sbin/mentohust' -type f -print -quit)
           test -n "$binary"
           file "$binary" | tee artifacts/elf-info.txt
           grep -q 'MIPS' artifacts/elf-info.txt
