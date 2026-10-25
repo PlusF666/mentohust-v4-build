@@ -49,7 +49,7 @@ jobs:
             CATEGORY:=Network
             TITLE:=MentoHUST with Ruijie V4 support
             URL:=https://github.com/hyrathb/mentohust
-            DEPENDS:=+libpcap
+            DEPENDS:=+libpcap1
           endef
           define Package/mentohust/description
             MentoHUST V4.0-alpha2, commit c4865225b415e862ec6b64b93a14eed45b83800c.
@@ -73,11 +73,11 @@ jobs:
         run: |
           set -euo pipefail
           cd sdk
-          ./scripts/feeds update packages
-          ./scripts/feeds install libpcap
+          ./scripts/feeds update -a
+          ./scripts/feeds install libpcap1
           cat >> .config <<'EOF'
           CONFIG_PACKAGE_mentohust=m
-          CONFIG_PACKAGE_libpcap=y
+          CONFIG_PACKAGE_libpcap1=y
           # CONFIG_ALL is not set
           # CONFIG_ALL_NONSHARED is not set
           # CONFIG_ALL_KMODS is not set
