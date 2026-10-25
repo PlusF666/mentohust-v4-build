@@ -1,0 +1,118 @@
+name: Build MentoHUST V4 for CR6606
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      SDK_URL: https://downloads.immortalwrt.org/releases/24.10.4/targets/ramips/mt7621/immortalwrt-sdk-24.10.4-ramips-mt7621_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+      SDK_SHA256: 61eb9228d9649cf92f8301ad19d9043f8da44321d9bb3e1337e94a2c3376437d
+      SOURCE_COMMIT: c4865225b415e862ec6b64b93a14eed45b83800c
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync unzip zlib1g-dev file wget curl zstd autoconf automake libtool pkg-config
+      - name: Download and verify SDK
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 "$SDK_URL" -o sdk.tar.zst
+          printf '%s  sdk.tar.zst\n' "$SDK_SHA256" | sha256sum -c -
+          mkdir sdk
+          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+      - name: Prepare pinned V4 source
+        run: |
+          set -euo pipefail
+          mkdir -p sdk/package/mentohust-v4/src
+          curl --fail --location --retry 3 "https://codeload.github.com/hyrathb/mentohust/tar.gz/$SOURCE_COMMIT" -o source.tar.gz
+          tar -xzf source.tar.gz -C sdk/package/mentohust-v4/src --strip-components=1
+          grep -q 'checkV4.c' sdk/package/mentohust-v4/src/src/Makefile.am
+          test -s sdk/package/mentohust-v4/src/src/checkV4.c
+          python3 - <<'PY'
+          from pathlib import Path
+          recipe = r'''include $(TOPDIR)/rules.mk
+          PKG_NAME:=mentohust
+          PKG_VERSION:=4.0.alpha2
+          PKG_RELEASE:=1
+          PKG_BUILD_DIR:=$(BUILD_DIR)/mentohust-$(PKG_VERSION)
+          PKG_FIXUP:=autoreconf
+          PKG_BUILD_PARALLEL:=1
+          include $(INCLUDE_DIR)/package.mk
+          define Package/mentohust
+            SECTION:=net
+            CATEGORY:=Network
+            TITLE:=MentoHUST with Ruijie V4 support
+            URL:=https://github.com/hyrathb/mentohust
+            DEPENDS:=+libpcap
+          endef
+          define Package/mentohust/description
+            MentoHUST V4.0-alpha2, commit c4865225b415e862ec6b64b93a14eed45b83800c.
+            Binary only: existing LuCI, init scripts and configuration are retained.
+          endef
+          define Build/Prepare
+          	$(call Build/Prepare/Default)
+          	$(CP) ./src/. $(PKG_BUILD_DIR)/
+          endef
+          TARGET_CFLAGS += -fcommon
+          CONFIGURE_ARGS += --with-pcap=dylib --disable-notify
+          define Package/mentohust/install
+          	$(INSTALL_DIR) $(1)/usr/sbin
+          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/mentohust $(1)/usr/sbin/mentohust
+          endef
+          $(eval $(call BuildPackage,mentohust))
+          '''
+          Path('sdk/package/mentohust-v4/Makefile').write_text(recipe.replace(r'	', '	'), encoding='utf-8')
+          PY
+      - name: Build IPK
+        run: |
+          set -euo pipefail
+          cd sdk
+          ./scripts/feeds update packages
+          ./scripts/feeds install libpcap
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_mentohust=m
+          CONFIG_PACKAGE_libpcap=y
+          # CONFIG_ALL is not set
+          # CONFIG_ALL_NONSHARED is not set
+          # CONFIG_ALL_KMODS is not set
+          # CONFIG_SIGNED_PACKAGES is not set
+          # CONFIG_PACKAGE_libpcap-dbus is not set
+          EOF
+          make defconfig
+          make package/mentohust-v4/compile -j2 V=s 2>&1 | tee ../build.log
+      - name: Collect and inspect packages
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find sdk/bin/packages -name 'mentohust_4.0.alpha2-1_mipsel_24kc.ipk' -exec cp {} artifacts/ ';'
+          test -s artifacts/mentohust_4.0.alpha2-1_mipsel_24kc.ipk
+          binary=$(find sdk/build_dir -path '*/src/mentohust' -type f | head -n 1)
+          test -n "$binary"
+          file "$binary" | tee artifacts/elf-info.txt
+          grep -q 'MIPS' artifacts/elf-info.txt
+          grep -q 'LSB' artifacts/elf-info.txt
+          printf 'Firmware: ImmortalWrt 24.10.4\nTarget: ramips/mt7621\nArchitecture: mipsel_24kc\nSource: https://github.com/hyrathb/mentohust\nCommit: %s\nSDK SHA256: %s\n' "$SOURCE_COMMIT" "$SDK_SHA256" > artifacts/build-info.txt
+          cp sdk/package/mentohust-v4/Makefile artifacts/package-Makefile.txt
+          cd artifacts
+          sha256sum *.ipk > SHA256SUMS
+      - name: Upload compiled package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mentohust-v4-immortalwrt-24.10.4-mipsel_24kc
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 14
